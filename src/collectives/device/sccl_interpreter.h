@@ -21,7 +21,7 @@ class scclFunction {
       struct ncclDevComm* comm = args->comm;
       struct scclAlgorithm* scclAlgo = &comm->scclAlgos[args->scclAlgoIndex];
       const int tid = threadIdx.x;
-      const int sync_tid = args->nThreads-1; // last thread is most likely not doing anthing and used for SCCL cross thread synchronization
+      const int nThreads = args->nThreads; // last thread is most likely not doing anthing and used for SCCL cross thread synchronization
       const int bid = blockIdx.x;
       struct scclThreadBlock* scclTB = &scclAlgo->scclTB[bid];
       const int channelId = scclTB->channelId;
@@ -53,12 +53,14 @@ class scclFunction {
         for (int i = 0; i < scclTB->nsteps; i++){
           struct scclTransfer* sccltran = &scclTB->transfers[i];
           // first wait if there is a dependence
-          int8_t dependentBid = sccltran->dependentBid;
-          int8_t dependentStep = sccltran->dependentStep;
-          if (sccltran->dependentBid >= 0){
-              if (tid == sync_tid){
-              uint64_t goalFlag = COMPUTE_FLAG(workIndex, iter, dependentStep);
-              while ((scclFlags + dependentBid)->flag < goalFlag){};
+          int16_t dependentPointer = sccltran->depencePointer;
+          int16_t numDependences = sccltran->numDependences;
+          if (sccltran->numDependences > 0){
+              for (int i = tid; i < numDependences; i += nThreads) {
+                int8_t dependentBid = scclTB->dependentBid[dependentPointer+i];
+                int16_t dependentStep = scclTB->dependentStep[dependentPointer+i];
+                uint64_t goalFlag = COMPUTE_FLAG(workIndex, iter, dependentStep);
+                while ((scclFlags + dependentBid)->flag < goalFlag){};
               }
               __syncthreads();
           }
@@ -70,40 +72,28 @@ class scclFunction {
             srcoffset = chunkOffset + (ssize_t) (sccltran->srcoffset+c) * sizePerScclChunk;
             dstoffset = chunkOffset + (ssize_t) (sccltran->dstoffset+c) * sizePerScclChunk;
             int thisCount = min(scclMaxAllowedCount, count-c);
-            switch (sccltran->type) {
-              case SCCL_SEND:
-                prims.send(srcPointer + srcoffset, dstoffset, thisCount);
-                break;
-              case SCCL_RECV:
-                prims.recv(dstPointer + dstoffset, dstoffset, thisCount);
-                break;
-              case SCCL_RECV_COPY_SEND:
-                prims.recvCopySend(dstPointer + dstoffset, dstoffset, thisCount);
-                break;
-              case SCCL_RECV_REDUCE_SEND:
-                prims.recvReduceSend(srcPointer + srcoffset, thisCount);
-                break;
-              case SCCL_RECV_REDUCE_COPY_SEND:
-                prims.recvReduceCopySend(srcPointer + srcoffset, dstPointer + dstoffset, thisCount);
-                break;
-              case SCCL_RECV_REDUCE_COPY:
-                prims.recvReduceCopy(srcPointer + srcoffset, dstPointer + dstoffset, thisCount);
-                break;
-              case SCCL_REDUCE:
-                prims.reduce(srcPointer + srcoffset, dstPointer + dstoffset, thisCount);
-                break;
-              case SCCL_LOCAL_COPY:
-                prims.localCopy(srcPointer + srcoffset, dstPointer + dstoffset, thisCount);
-                break;
-              case SCCL_NO_OP:
-                break;
-              default:
-                return;
-            }
+            if (sccltran->type == SCCL_SEND)
+              prims.send(srcPointer + srcoffset, dstoffset, thisCount);
+            else if (sccltran->type == SCCL_RECV)
+              prims.recv(dstPointer + dstoffset, dstoffset, thisCount);
+            else if (sccltran->type == SCCL_RECV_COPY_SEND)
+              prims.recvCopySend(dstPointer + dstoffset, dstoffset, thisCount);
+            else if (sccltran->type == SCCL_RECV_REDUCE_SEND)
+              prims.recvReduceSend(srcPointer + srcoffset, thisCount);
+            else if (sccltran->type == SCCL_RECV_REDUCE_COPY_SEND)
+              prims.recvReduceCopySend(srcPointer + srcoffset, dstPointer + dstoffset, thisCount);
+            else if (sccltran->type == SCCL_RECV_REDUCE_COPY)
+              prims.recvReduceCopy(srcPointer + srcoffset, dstPointer + dstoffset, thisCount);
+            else if (sccltran->type == SCCL_REDUCE)
+              prims.reduce(srcPointer + srcoffset, dstPointer + dstoffset, thisCount);
+            else if (sccltran->type == SCCL_LOCAL_COPY)
+              prims.localCopy(srcPointer + srcoffset, dstPointer + dstoffset, thisCount);
+            else
+              return;
           }
           if (sccltran->has_dependence)
             __syncthreads();
-          if (tid == sync_tid && sccltran->has_dependence){
+          if (tid == nThreads-1 && sccltran->has_dependence){
             __threadfence();
             uint64_t curFlag = COMPUTE_FLAG(workIndex, iter, i);
             scclFlags[bid].flag = curFlag;
