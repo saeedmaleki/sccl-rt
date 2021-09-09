@@ -56,13 +56,13 @@ class scclFunction {
           int16_t dependentPointer = sccltran->depencePointer;
           int16_t numDependences = sccltran->numDependences;
           if (sccltran->numDependences > 0){
-              for (int i = tid; i < numDependences; i += nThreads) {
-                int8_t dependentBid = scclTB->dependentBid[dependentPointer+i];
-                int16_t dependentStep = scclTB->dependentStep[dependentPointer+i];
-                uint64_t goalFlag = COMPUTE_FLAG(workIndex, iter, dependentStep);
-                while ((scclFlags + dependentBid)->flag < goalFlag){};
-              }
-              __syncthreads();
+            for (int index = tid; index < numDependences; index += nThreads) {
+              int8_t dependentBid = scclTB->dependentBid[dependentPointer+index];
+              int16_t dependentStep = scclTB->dependentStep[dependentPointer+index];
+              uint64_t goalFlag = COMPUTE_FLAG(workIndex, iter, dependentStep);
+              while ((scclFlags + dependentBid)->flag < goalFlag){};
+            }
+            __syncthreads();
           }
 
           srcPointer = (sccltran->srcbuffer == SCCL_INPUT_BUFFER) ? thisInput : ((sccltran->srcbuffer == SCCL_OUTPUT_BUFFER) ? thisOutput : thisScratch);
@@ -275,3 +275,72 @@ struct LLWrapper {
 
 template<class FUNC, typename T, int UNROLL>
 class scclFunctionLL : public scclFunction<T, LLWrapper<FUNC, T>> {};
+
+// Manually written functions
+
+template<class FUNC, typename T, int UNROLL>
+class scclFunctionManual {
+  public:
+    __device__ void run(struct ncclWorkElem* args, int sizeMultiplier) {
+      struct ncclDevComm* comm = args->comm;
+      const int tid = threadIdx.x;
+      const int sync_tid = args->nThreads-1; // last thread is most likely not doing anthing and used for SCCL cross thread synchronization
+      const int bid = blockIdx.x;
+      const int bdim = blockDim.x;
+      struct ncclChannel* channel = comm->channels;
+
+      // Compute pointers
+      T * thisInput = (T*)args->sendbuff;
+
+      T * thisScratch = (T*)args->scratchbuff;
+      int myRank = channel->ring.devUserRanks[0];
+      int peer = (myRank > bid) ? bid : bid+1;
+      LLWrapper<FUNC,T> prims{args, tid, &peer, &peer, thisInput, channel};
+
+      const ssize_t size = args->coll.count;
+      const int sizePerChunk = size/8;
+      size_t chunkOffset = prims.initIter(sizePerChunk, 0);
+
+      // sccl flags all start out with 0. this is used as a part of the flag to make sure different work items deal with different synchronization flags
+      // this still needs more work. when we make a way around the queue, the flag might have been set to undesired values. will be fixed in subsequent versions.
+      const int workIndex = args->index+1;
+      volatile struct scclFlag* scclFlags = comm->scclAlgoShared.flags;
+
+      prims.send(thisInput+peer*sizePerChunk, peer*sizePerChunk, 1);
+      prims.recv(thisScratch+bid*sizePerChunk, bid*sizePerChunk, 1);
+      if (tid == sync_tid){
+        __threadfence();
+        uint64_t curFlag = COMPUTE_FLAG(workIndex, 0, 0);
+        scclFlags[bid].flag = curFlag;
+      }
+      if (tid < 7){
+        uint64_t goalFlag = COMPUTE_FLAG(workIndex, 0, 0);
+        while ((scclFlags + tid)->flag < goalFlag){};
+      }
+      __syncthreads();
+
+      const int nthreads = args->nThreads;
+      for (int j = bid*bdim+tid; j < sizePerChunk; j += nthreads*7){
+        T t = thisInput[myRank*sizePerChunk+j];
+        for (int i = 0; i < 7; i++){
+          T c = thisScratch[i*sizePerChunk+j];
+          t = c + t;
+        }
+        thisInput[myRank*sizePerChunk+j] = t;
+      }
+      __syncthreads();
+
+      if (bid*bdim < sizePerChunk && tid == sync_tid){
+        __threadfence();
+        uint64_t curFlag = COMPUTE_FLAG(workIndex, 0, 1);
+        scclFlags[bid].flag = curFlag;
+      }
+      if (tid*bdim < sizePerChunk && tid < 7){
+        uint64_t goalFlag = COMPUTE_FLAG(workIndex, 0, 1);
+        while ((scclFlags + tid)->flag < goalFlag){};
+      }
+      __syncthreads();
+      prims.send(thisInput+myRank*sizePerChunk, myRank*sizePerChunk, 1);
+      prims.recv(thisInput+peer*sizePerChunk, peer*sizePerChunk, 1);
+    }
+};

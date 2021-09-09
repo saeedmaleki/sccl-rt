@@ -916,7 +916,7 @@ ncclResult_t scclGetAlgoFromXMLAndSetComm(struct ncclComm* comm, const char* str
                   checkSrc = 1;
                   checkDst = 1;
                 } else if (strcmp(type, "nop") == 0) {
-                  transferType = 1;
+                  transferType = -1;
                 } else {
                   WARN("SCCL: type of transfer is not supported: %s", type);
                   return ncclInternalError;
@@ -929,7 +929,7 @@ ncclResult_t scclGetAlgoFromXMLAndSetComm(struct ncclComm* comm, const char* str
                 } 
                 if (transferType != -1) {
                   struct scclTransfer* sccltran = &sTB->transfers[numTransfers];
-
+                  sccltran->type = transferType;
                   sccltran->srcoffset = srcoffset;
                   NCCLCHECK(scclGetBufferType(srcbuffer, &sccltran->srcbuffer));
                   sccltran->srcoffset = srcoffset;
@@ -970,6 +970,7 @@ ncclResult_t scclGetAlgoFromXMLAndSetComm(struct ncclComm* comm, const char* str
 
                   sccltran->depencePointer = oldDependencePointer;
                   sccltran->numDependences = numDependences - oldDependencePointer;
+                  oldDependencePointer = numDependences;
 
                   if (has_dependence != 0 && has_dependence != 1){
                     WARN("SCCL: has_dependence needs to be 0 or 1, but it was %d", has_dependence);
